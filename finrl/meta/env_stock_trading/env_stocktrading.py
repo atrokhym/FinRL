@@ -10,6 +10,7 @@ import pandas as pd
 from gymnasium import spaces
 from gymnasium.utils import seeding
 from stable_baselines3.common.vec_env import DummyVecEnv
+from pathlib import Path # Added for directory creation
 
 matplotlib.use("Agg")
 
@@ -61,7 +62,17 @@ class StockTradingEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.state_space,)
         )
-        self.data = self.df.loc[self.day, :]
+        # Ensure index is DatetimeIndex if it wasn't already set by the caller
+        if not isinstance(self.df.index, pd.DatetimeIndex):
+            try:
+                 self.df.index = pd.to_datetime(self.df.index)
+                 print("StockTradingEnv Info: Converted DataFrame index to DatetimeIndex.")
+            except Exception as e:
+                 print(f"StockTradingEnv Warning: Failed to convert index to DatetimeIndex: {e}")
+
+        # Access data using iloc based on day and stock_dim
+        # Assumes df has DatetimeIndex and is sorted by date, then tic
+        self.data = self.df.iloc[self.day * self.stock_dim : (self.day + 1) * self.stock_dim]
         self.terminal = False
         self.make_plots = make_plots
         self.print_verbosity = print_verbosity
@@ -101,12 +112,8 @@ class StockTradingEnv(gym.Env):
 
     def _sell_stock(self, index, action):
         def _do_sell_normal():
-            if (
-                self.state[index + 2 * self.stock_dim + 1] != True
-            ):  # check if the stock is able to sell, for simlicity we just add it in techical index
-                # if self.state[index + 1] > 0: # if we use price<0 to denote a stock is unable to trade in that day, the total asset calculation may be wrong for the price is unreasonable
-                # Sell only if the price is > 0 (no missing data in this particular date)
-                # perform sell action based on the sign of the action
+            # Check if price is positive (data available)
+            if self.state[index + 1] > 0:
                 if self.state[index + self.stock_dim + 1] > 0:
                     # Sell only if current asset is > 0
                     sell_num_shares = min(
@@ -137,8 +144,7 @@ class StockTradingEnv(gym.Env):
         # perform sell action based on the sign of the action
         if self.turbulence_threshold is not None:
             if self.turbulence >= self.turbulence_threshold:
-                if self.state[index + 1] > 0:
-                    # Sell only if the price is > 0 (no missing data in this particular date)
+                if self.state[index + 1] > 0: # Check price > 0
                     # if turbulence goes over threshold, just clear out all positions
                     if self.state[index + self.stock_dim + 1] > 0:
                         # Sell only if current asset is > 0
@@ -170,17 +176,11 @@ class StockTradingEnv(gym.Env):
 
     def _buy_stock(self, index, action):
         def _do_buy():
-            if (
-                self.state[index + 2 * self.stock_dim + 1] != True
-            ):  # check if the stock is able to buy
-                # if self.state[index + 1] >0:
-                # Buy only if the price is > 0 (no missing data in this particular date)
+             # Check if price is positive
+            if self.state[index + 1] > 0:
                 available_amount = self.state[0] // (
                     self.state[index + 1] * (1 + self.buy_cost_pct[index])
-                )  # when buying stocks, we should consider the cost of trading when calculating available_amount, or we may be have cash<0
-                # print('available_amount:{}'.format(available_amount))
-
-                # update balance
+                )
                 buy_num_shares = min(available_amount, action)
                 buy_amount = (
                     self.state[index + 1]
@@ -188,16 +188,13 @@ class StockTradingEnv(gym.Env):
                     * (1 + self.buy_cost_pct[index])
                 )
                 self.state[0] -= buy_amount
-
                 self.state[index + self.stock_dim + 1] += buy_num_shares
-
                 self.cost += (
                     self.state[index + 1] * buy_num_shares * self.buy_cost_pct[index]
                 )
                 self.trades += 1
             else:
                 buy_num_shares = 0
-
             return buy_num_shares
 
         # perform buy action based on the sign of the action
@@ -209,18 +206,27 @@ class StockTradingEnv(gym.Env):
             else:
                 buy_num_shares = 0
                 pass
-
         return buy_num_shares
 
     def _make_plot(self):
+        # Ensure results directory exists
+        results_dir = Path("results")
+        results_dir.mkdir(parents=True, exist_ok=True)
         plt.plot(self.asset_memory, "r")
-        plt.savefig(f"results/account_value_trade_{self.episode}.png")
+        plt.savefig(results_dir / f"account_value_trade_{self.episode}.png")
         plt.close()
 
     def step(self, actions):
-        self.terminal = self.day >= len(self.df.index.unique()) - 1
+        # Use unique dates in the index to determine terminal condition
+        # Handle potential MultiIndex or DatetimeIndex
+        if isinstance(self.df.index, pd.MultiIndex):
+             num_unique_days = len(self.df.index.get_level_values(0).unique())
+        else:
+             num_unique_days = len(self.df.index.unique())
+
+        self.terminal = self.day >= num_unique_days - 1
+
         if self.terminal:
-            # print(f"Episode: {self.episode}")
             if self.make_plots:
                 self._make_plot()
             end_total_asset = self.state[0] + sum(
@@ -228,30 +234,27 @@ class StockTradingEnv(gym.Env):
                 * np.array(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
             )
             df_total_value = pd.DataFrame(self.asset_memory)
-            tot_reward = (
-                self.state[0]
-                + sum(
-                    np.array(self.state[1 : (self.stock_dim + 1)])
-                    * np.array(
-                        self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)]
-                    )
-                )
-                - self.asset_memory[0]
-            )  # initial_amount is only cash part of our initial asset
+            tot_reward = end_total_asset - self.asset_memory[0]
+
             df_total_value.columns = ["account_value"]
             df_total_value["date"] = self.date_memory
-            df_total_value["daily_return"] = df_total_value["account_value"].pct_change(
-                1
-            )
-            if df_total_value["daily_return"].std() != 0:
+            df_total_value["daily_return"] = df_total_value["account_value"].pct_change(1)
+
+            sharpe = 0.0 # Default value
+            # Calculate Sharpe Ratio only if standard deviation is non-zero and not NaN
+            if df_total_value["daily_return"].std() != 0 and not np.isnan(df_total_value["daily_return"].std()):
                 sharpe = (
                     (252**0.5)
                     * df_total_value["daily_return"].mean()
                     / df_total_value["daily_return"].std()
                 )
+
             df_rewards = pd.DataFrame(self.rewards_memory)
             df_rewards.columns = ["account_rewards"]
-            df_rewards["date"] = self.date_memory[:-1]
+            if len(self.date_memory) > 1: # Check if there's more than the initial date
+                 # Ensure the length matches rewards_memory
+                 df_rewards["date"] = self.date_memory[1:] # Rewards correspond to steps taken
+
             if self.episode % self.print_verbosity == 0:
                 print(f"day: {self.day}, episode: {self.episode}")
                 print(f"begin_total_asset: {self.asset_memory[0]:0.2f}")
@@ -259,87 +262,74 @@ class StockTradingEnv(gym.Env):
                 print(f"total_reward: {tot_reward:0.2f}")
                 print(f"total_cost: {self.cost:0.2f}")
                 print(f"total_trades: {self.trades}")
-                if df_total_value["daily_return"].std() != 0:
-                    print(f"Sharpe: {sharpe:0.3f}")
+                print(f"Sharpe: {sharpe:0.3f}") # Print Sharpe even if 0
                 print("=================================")
 
             if (self.model_name != "") and (self.mode != ""):
+                # Ensure results directory exists
+                results_dir = Path("results")
+                results_dir.mkdir(parents=True, exist_ok=True)
+
                 df_actions = self.save_action_memory()
-                df_actions.to_csv(
-                    "results/actions_{}_{}_{}.csv".format(
-                        self.mode, self.model_name, self.iteration
-                    )
-                )
-                df_total_value.to_csv(
-                    "results/account_value_{}_{}_{}.csv".format(
-                        self.mode, self.model_name, self.iteration
-                    ),
-                    index=False,
-                )
-                df_rewards.to_csv(
-                    "results/account_rewards_{}_{}_{}.csv".format(
-                        self.mode, self.model_name, self.iteration
-                    ),
-                    index=False,
-                )
+                df_actions.to_csv(results_dir / f"actions_{self.mode}_{self.model_name}_{self.iteration}.csv")
+                df_total_value.to_csv(results_dir / f"account_value_{self.mode}_{self.model_name}_{self.iteration}.csv", index=False)
+                df_rewards.to_csv(results_dir / f"account_rewards_{self.mode}_{self.model_name}_{self.iteration}.csv", index=False)
                 plt.plot(self.asset_memory, "r")
-                plt.savefig(
-                    "results/account_value_{}_{}_{}.png".format(
-                        self.mode, self.model_name, self.iteration
-                    )
-                )
+                plt.savefig(results_dir / f"account_value_{self.mode}_{self.model_name}_{self.iteration}.png")
                 plt.close()
 
-            # Add outputs to logger interface
-            # logger.record("environment/portfolio_value", end_total_asset)
-            # logger.record("environment/total_reward", tot_reward)
-            # logger.record("environment/total_reward_pct", (tot_reward / (end_total_asset - tot_reward)) * 100)
-            # logger.record("environment/total_cost", self.cost)
-            # logger.record("environment/total_trades", self.trades)
-
-            return self.state, self.reward, self.terminal, False, {}
+            # Gymnasium expects 5 return values: obs, reward, terminated, truncated, info
+            return self.state, self.reward, self.terminal, False, {} # Return truncated as False when terminal
 
         else:
             actions = actions * self.hmax  # actions initially is scaled between 0 to 1
-            actions = actions.astype(
-                int
-            )  # convert into integer because we can't by fraction of shares
+            actions = actions.astype(int)
+
+            # Update turbulence before potentially overriding actions
+            # Note: self.data already points to the correct slice for the *upcoming* state update (day d+1)
+            # If turbulence check needs data from day d, access self.df directly using iloc for day d
+            current_day_data_slice = self.df.iloc[self.day * self.stock_dim : (self.day + 1) * self.stock_dim]
             if self.turbulence_threshold is not None:
+                if self.risk_indicator_col in current_day_data_slice.columns:
+                    try:
+                        self.turbulence = current_day_data_slice[self.risk_indicator_col].iloc[0]
+                    except IndexError:
+                        print(f"Warning: Could not access turbulence data at day {self.day}, index 0. Slice shape: {current_day_data_slice.shape}. Setting turbulence to 0.")
+                        self.turbulence = 0
+                else:
+                    print(f"Warning: Turbulence column '{self.risk_indicator_col}' not found. Setting turbulence to 0.")
+                    self.turbulence = 0
+
+                # Apply turbulence action override
                 if self.turbulence >= self.turbulence_threshold:
                     actions = np.array([-self.hmax] * self.stock_dim)
+
             begin_total_asset = self.state[0] + sum(
                 np.array(self.state[1 : (self.stock_dim + 1)])
                 * np.array(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
             )
-            # print("begin_total_asset:{}".format(begin_total_asset))
 
             argsort_actions = np.argsort(actions)
             sell_index = argsort_actions[: np.where(actions < 0)[0].shape[0]]
             buy_index = argsort_actions[::-1][: np.where(actions > 0)[0].shape[0]]
 
             for index in sell_index:
-                # print(f"Num shares before: {self.state[index+self.stock_dim+1]}")
-                # print(f'take sell action before : {actions[index]}')
                 actions[index] = self._sell_stock(index, actions[index]) * (-1)
-                # print(f'take sell action after : {actions[index]}')
-                # print(f"Num shares after: {self.state[index+self.stock_dim+1]}")
 
             for index in buy_index:
-                # print('take buy action: {}'.format(actions[index]))
                 actions[index] = self._buy_stock(index, actions[index])
 
             self.actions_memory.append(actions)
 
             # state: s -> s+1
             self.day += 1
-            self.data = self.df.loc[self.day, :]
-            if self.turbulence_threshold is not None:
-                if len(self.df.tic.unique()) == 1:
-                    self.turbulence = self.data[self.risk_indicator_col]
-                elif len(self.df.tic.unique()) > 1:
-                    self.turbulence = self.data[self.risk_indicator_col].values[0]
+            # Access data using iloc based on day and stock_dim for the *next* day
+            self.data = self.df.iloc[self.day * self.stock_dim : (self.day + 1) * self.stock_dim]
+
+            # Update state using the new self.data slice
             self.state = self._update_state()
 
+            # Calculate end total asset *after* state update
             end_total_asset = self.state[0] + sum(
                 np.array(self.state[1 : (self.stock_dim + 1)])
                 * np.array(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
@@ -349,11 +339,10 @@ class StockTradingEnv(gym.Env):
             self.reward = end_total_asset - begin_total_asset
             self.rewards_memory.append(self.reward)
             self.reward = self.reward * self.reward_scaling
-            self.state_memory.append(
-                self.state
-            )  # add current state in state_recorder for each step
+            self.state_memory.append(self.state)
 
-        return self.state, self.reward, self.terminal, False, {}
+            # Gymnasium expects 5 return values: obs, reward, terminated, truncated, info
+            return self.state, self.reward, self.terminal, False, {} # Return truncated as False
 
     def reset(
         self,
@@ -361,11 +350,15 @@ class StockTradingEnv(gym.Env):
         seed=None,
         options=None,
     ):
-        # initiate state
+        # Gymnasium reset signature requires handling seed and options
+        super().reset(seed=seed) # Important for seeding the action space sampler etc.
+
+        # Reset internal state
         self.day = 0
-        self.data = self.df.loc[self.day, :]
+        self.data = self.df.iloc[self.day * self.stock_dim : (self.day + 1) * self.stock_dim]
         self.state = self._initiate_state()
 
+        # Reset memory
         if self.initial:
             self.asset_memory = [
                 self.initial_amount
@@ -375,175 +368,283 @@ class StockTradingEnv(gym.Env):
                 )
             ]
         else:
-            previous_total_asset = self.previous_state[0] + sum(
-                np.array(self.state[1 : (self.stock_dim + 1)])
-                * np.array(
-                    self.previous_state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)]
-                )
-            )
-            self.asset_memory = [previous_total_asset]
+            # This logic might be less relevant now if each episode starts fresh
+            # Keep it for now, but ensure previous_state handling is correct if used.
+            if self.previous_state and len(self.previous_state) > 0:
+                 previous_total_asset = self.previous_state[0] + sum(
+                     np.array(self.state[1 : (self.stock_dim + 1)])
+                     * np.array(
+                         self.previous_state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)]
+                     )
+                 )
+                 self.asset_memory = [previous_total_asset]
+            else: # Fallback if previous_state is invalid
+                 self.asset_memory = [self.initial_amount]
 
         self.turbulence = 0
         self.cost = 0
         self.trades = 0
         self.terminal = False
-        # self.iteration=self.iteration
         self.rewards_memory = []
         self.actions_memory = []
         self.date_memory = [self._get_date()]
-
         self.episode += 1
 
+        # Gymnasium reset returns obs, info
         return self.state, {}
 
     def render(self, mode="human", close=False):
         return self.state
 
     def _initiate_state(self):
+        # Ensures data slice is valid before accessing
+        if self.data.empty:
+             print(f"Warning: Data slice empty during _initiate_state at day {self.day}. Returning zeros.")
+             # Return a state of appropriate shape filled with zeros or handle error
+             # Shape is 1 (balance) + stock_dim (prices) + stock_dim (shares) + N indicators * stock_dim
+             state_len = 1 + 2 * self.stock_dim + len(self.tech_indicator_list) * self.stock_dim
+             # Return as numpy array of correct shape/dtype even if zeros
+             return np.zeros(state_len, dtype=np.float32)
+
+        # Check if self.df has 'tic' column for multi-stock check
+        # Use self.data which is the relevant slice for the current day
+        is_multi_stock = 'tic' in self.data.columns and len(self.data['tic'].unique()) > 1
+
         if self.initial:
             # For Initial State
-            if len(self.df.tic.unique()) > 1:
-                # for multiple stock
+            if is_multi_stock:
                 state = (
-                    [self.initial_amount]
-                    + self.data.close.values.tolist()
-                    + self.num_stock_shares
+                    [self.initial_amount] # Cash
+                    + self.data.close.values.tolist() # Prices
+                    + (self.num_stock_shares if isinstance(self.num_stock_shares, list) else []) # Shares (ensure list, default empty if invalid)
                     + sum(
                         (
                             self.data[tech].values.tolist()
-                            for tech in self.tech_indicator_list
+                            for tech in self.tech_indicator_list if tech in self.data
                         ),
                         [],
-                    )
-                )  # append initial stocks_share to initial state, instead of all zero
-            else:
-                # for single stock
+                    ) # Indicators
+                )
+            else: # Single stock case (or fallback if 'tic' column missing)
                 state = (
-                    [self.initial_amount]
-                    + [self.data.close]
-                    + [0] * self.stock_dim
-                    + sum(([self.data[tech]] for tech in self.tech_indicator_list), [])
+                    [self.initial_amount] # Cash
+                    + [self.data.close.iloc[0] if not self.data.close.empty else 0] # Price
+                    + (self.num_stock_shares if isinstance(self.num_stock_shares, list) else []) # Shares (ensure list, default empty if invalid)
+                    + sum(([self.data[tech].iloc[0] if tech in self.data and not self.data[tech].empty else 0] for tech in self.tech_indicator_list), []) # Indicators
                 )
         else:
-            # Using Previous State
-            if len(self.df.tic.unique()) > 1:
-                # for multiple stock
+            # Using Previous State - Ensure previous_state is valid
+            if not self.previous_state or len(self.previous_state) < 1 + 2 * self.stock_dim:
+                 print("Warning: Invalid previous_state provided to _initiate_state. Re-initializing.")
+                 # Fallback to initial state logic
+                 self.initial = True
+                 return self._initiate_state() # This will call _initiate_state again with initial=True
+
+            if is_multi_stock:
                 state = (
-                    [self.previous_state[0]]
-                    + self.data.close.values.tolist()
+                    [self.previous_state[0]] # Cash
+                    + self.data.close.values.tolist() # Current prices
                     + self.previous_state[
-                        (self.stock_dim + 1) : (self.stock_dim * 2 + 1)
+                        (self.stock_dim + 1) : (self.stock_dim * 2 + 1) # Previous shares
                     ]
                     + sum(
                         (
                             self.data[tech].values.tolist()
-                            for tech in self.tech_indicator_list
+                            for tech in self.tech_indicator_list if tech in self.data
                         ),
                         [],
-                    )
+                    ) # Current indicators
                 )
-            else:
-                # for single stock
+            else: # Single stock case
                 state = (
-                    [self.previous_state[0]]
-                    + [self.data.close]
+                    [self.previous_state[0]] # Cash
+                    + [self.data.close.iloc[0] if not self.data.close.empty else 0] # Current price
                     + self.previous_state[
-                        (self.stock_dim + 1) : (self.stock_dim * 2 + 1)
+                        (self.stock_dim + 1) : (self.stock_dim * 2 + 1) # Previous shares (list of 1 value)
                     ]
-                    + sum(([self.data[tech]] for tech in self.tech_indicator_list), [])
+                    + sum(([self.data[tech].iloc[0] if tech in self.data and not self.data[tech].empty else 0] for tech in self.tech_indicator_list), []) # Current indicators
                 )
-        return state
+
+        # Removed state length validation/padding logic
+        # Let potential length errors surface during array conversion or later checks
+        try:
+            np_state = np.array(state, dtype=np.float32)
+            expected_len = 1 + 2 * self.stock_dim + len(self.tech_indicator_list) * self.stock_dim
+            if np_state.shape[0] != expected_len:
+                print(f"ERROR: State length mismatch in _initiate_state AFTER construction. Expected {expected_len}, Got {np_state.shape[0]}. This indicates indicators might be missing from self.data or tech_indicator_list.")
+                # Optional: Raise an error here to stop execution immediately
+                # raise ValueError(f"State length mismatch: Expected {expected_len}, Got {np_state.shape[0]}")
+            return np_state
+        except ValueError as e:
+            print(f"ERROR creating numpy state array in _initiate_state: {e}")
+            print(f"Original state list length: {len(state)}")
+            # Fallback: Return zeros if array creation fails
+            state_len = 1 + 2 * self.stock_dim + len(self.tech_indicator_list) * self.stock_dim
+            return np.zeros(state_len, dtype=np.float32)
+
 
     def _update_state(self):
-        if len(self.df.tic.unique()) > 1:
-            # for multiple stock
+        # Ensures data slice is valid before accessing
+        if self.data.empty:
+             print(f"Warning: Data slice empty during _update_state at day {self.day}. Returning previous state.")
+             # Ensure previous state is returned as numpy array
+             return np.array(self.state, dtype=np.float32) if not isinstance(self.state, np.ndarray) else self.state
+
+        is_multi_stock = 'tic' in self.data.columns and len(self.data['tic'].unique()) > 1
+
+        if is_multi_stock:
             state = (
-                [self.state[0]]
-                + self.data.close.values.tolist()
-                + list(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
+                [self.state[0]] # Cash
+                + self.data.close.values.tolist() # Current prices
+                + list(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)]) # Current shares
                 + sum(
                     (
                         self.data[tech].values.tolist()
-                        for tech in self.tech_indicator_list
+                        for tech in self.tech_indicator_list if tech in self.data
                     ),
                     [],
-                )
+                ) # Current indicators
             )
-
-        else:
-            # for single stock
+        else: # Single stock case
             state = (
-                [self.state[0]]
-                + [self.data.close]
-                + list(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
-                + sum(([self.data[tech]] for tech in self.tech_indicator_list), [])
+                [self.state[0]] # Cash
+                + [self.data.close.iloc[0] if not self.data.close.empty else 0] # Current price
+                + list(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)]) # Current shares (list of 1 value)
+                + sum(([self.data[tech].iloc[0] if tech in self.data and not self.data[tech].empty else 0] for tech in self.tech_indicator_list), []) # Current indicators
             )
 
-        return state
+        # Removed state length validation/padding logic
+        try:
+            np_state = np.array(state, dtype=np.float32)
+            expected_len = 1 + 2 * self.stock_dim + len(self.tech_indicator_list) * self.stock_dim
+            if np_state.shape[0] != expected_len:
+                print(f"ERROR: State length mismatch in _update_state AFTER construction. Expected {expected_len}, Got {np_state.shape[0]}.")
+                # Optional: Raise error
+                # raise ValueError(f"State length mismatch: Expected {expected_len}, Got {np_state.shape[0]}")
+            return np_state
+        except ValueError as e:
+            print(f"ERROR creating numpy state array in _update_state: {e}")
+            print(f"Original state list length: {len(state)}")
+            # Fallback: Return previous state if array creation fails
+            return np.array(self.state, dtype=np.float32) if not isinstance(self.state, np.ndarray) else self.state
+
 
     def _get_date(self):
-        if len(self.df.tic.unique()) > 1:
-            date = self.data.date.unique()[0]
+        # Access the index (which should be DatetimeIndex now) of the current data slice
+        # Since all rows in the slice share the same date, get the first one
+        if not self.data.empty and isinstance(self.data.index, pd.DatetimeIndex):
+             # Handle MultiIndex case where 'date' might be the first level
+             if isinstance(self.data.index, pd.MultiIndex):
+                 date = self.data.index.get_level_values(0)[0]
+             else:
+                 date = self.data.index[0]
         else:
-            date = self.data.date
+             # Handle case where data slice might be empty or index is not datetime
+             date = None # Or handle appropriately
         return date
 
     # add save_state_memory to preserve state in the trading process
     def save_state_memory(self):
-        if len(self.df.tic.unique()) > 1:
-            # date and close price length must match actions length
-            date_list = self.date_memory[:-1]
-            df_date = pd.DataFrame(date_list)
-            df_date.columns = ["date"]
+        # Requires 'tic' column for differentiation if multi-stock
+        is_multi_stock = 'tic' in self.df.columns and len(self.df['tic'].unique()) > 1
 
-            state_list = self.state_memory
-            df_states = pd.DataFrame(
-                state_list,
-                columns=[
-                    "cash",
-                    "Bitcoin_price",
-                    "Gold_price",
-                    "Bitcoin_num",
-                    "Gold_num",
-                    "Bitcoin_Disable",
-                    "Gold_Disable",
-                ],
-            )
-            df_states.index = df_date.date
-            # df_actions = pd.DataFrame({'date':date_list,'actions':action_list})
-        else:
-            date_list = self.date_memory[:-1]
-            state_list = self.state_memory
-            df_states = pd.DataFrame({"date": date_list, "states": state_list})
-        # print(df_states)
+        date_list = self.date_memory[:-1] # Dates corresponding to states recorded
+        state_list = self.state_memory
+
+        if not state_list:
+             return pd.DataFrame() # Return empty if no states were recorded
+
+        if is_multi_stock:
+            # Define columns dynamically based on stock_dim and indicators
+            price_cols = [f'price_{i}' for i in range(self.stock_dim)]
+            share_cols = [f'shares_{i}' for i in range(self.stock_dim)]
+            indicator_cols = [f'{tech}_{i}' for i in range(self.stock_dim) for tech in self.tech_indicator_list]
+            all_cols = ['cash'] + price_cols + share_cols + indicator_cols
+
+            # Ensure state_list elements have the correct length, pad/truncate if necessary
+            expected_len = 1 + 2 * self.stock_dim + len(self.tech_indicator_list) * self.stock_dim
+            processed_state_list = []
+            for state in state_list:
+                 # Ensure state is a list or numpy array before checking len
+                 current_state = state.tolist() if isinstance(state, np.ndarray) else list(state)
+                 if len(current_state) != expected_len:
+                      print(f"Warning: State length mismatch in save_state_memory. Expected {expected_len}, Got {len(current_state)}. Adjusting...")
+                      current_state = (current_state + [0.0] * expected_len)[:expected_len]
+                 processed_state_list.append(current_state)
+
+            df_states = pd.DataFrame(processed_state_list, columns=all_cols)
+            if len(date_list) == len(df_states):
+                 df_states['date'] = date_list
+                 # Ensure date is the index name
+                 df_states = df_states.set_index(pd.Index(date_list, name='date'))
+            else:
+                 print("Warning: Mismatch between date_list and state_list lengths in save_state_memory.")
+
+        else: # Single stock case
+            all_cols = ['cash', 'price', 'shares'] + self.tech_indicator_list
+            expected_len = 1 + 1 + 1 + len(self.tech_indicator_list) # Adjust based on actual single stock state structure
+            processed_state_list = []
+            for state in state_list:
+                 current_state = state.tolist() if isinstance(state, np.ndarray) else list(state)
+                 if len(current_state) != expected_len:
+                      print(f"Warning: State length mismatch (single stock) in save_state_memory. Expected {expected_len}, Got {len(current_state)}. Adjusting...")
+                      current_state = (current_state + [0.0] * expected_len)[:expected_len]
+                 processed_state_list.append(current_state)
+
+            df_states = pd.DataFrame(processed_state_list, columns=all_cols)
+            if len(date_list) == len(df_states):
+                 df_states['date'] = date_list
+                 df_states = df_states.set_index(pd.Index(date_list, name='date'))
+            else:
+                 print("Warning: Mismatch between date_list and state_list lengths (single stock) in save_state_memory.")
+
         return df_states
 
     def save_asset_memory(self):
         date_list = self.date_memory
         asset_list = self.asset_memory
-        # print(len(date_list))
-        # print(len(asset_list))
+        if len(date_list) != len(asset_list):
+            print(f"Warning: Mismatch in length of date_memory ({len(date_list)}) and asset_memory ({len(asset_list)})")
+            # Adjust to minimum length
+            min_len = min(len(date_list), len(asset_list))
+            date_list = date_list[:min_len]
+            asset_list = asset_list[:min_len]
+
         df_account_value = pd.DataFrame(
             {"date": date_list, "account_value": asset_list}
         )
         return df_account_value
 
     def save_action_memory(self):
-        if len(self.df.tic.unique()) > 1:
-            # date and close price length must match actions length
-            date_list = self.date_memory[:-1]
-            df_date = pd.DataFrame(date_list)
-            df_date.columns = ["date"]
+        date_list = self.date_memory[:-1] # Actions correspond to steps taken
+        action_list = self.actions_memory
 
-            action_list = self.actions_memory
-            df_actions = pd.DataFrame(action_list)
-            df_actions.columns = self.data.tic.values
-            df_actions.index = df_date.date
-            # df_actions = pd.DataFrame({'date':date_list,'actions':action_list})
-        else:
-            date_list = self.date_memory[:-1]
-            action_list = self.actions_memory
-            df_actions = pd.DataFrame({"date": date_list, "actions": action_list})
+        if len(date_list) != len(action_list):
+            print(f"Warning: Mismatch in length of date_memory[:-1] ({len(date_list)}) and actions_memory ({len(action_list)})")
+            min_len = min(len(date_list), len(action_list))
+            date_list = date_list[:min_len]
+            action_list = action_list[:min_len]
+
+        df_actions = pd.DataFrame(action_list)
+
+        # Try to get ticker names for columns if possible
+        try:
+             # Use tickers from the initial data slice if available
+             initial_data = self.df.iloc[0 * self.stock_dim : (0 + 1) * self.stock_dim]
+             if 'tic' in initial_data.columns:
+                  # Ensure number of actions matches stock_dim
+                  if df_actions.shape[1] == self.stock_dim:
+                       df_actions.columns = initial_data['tic'].values
+                  else:
+                       df_actions.columns = [f'action_{i}' for i in range(df_actions.shape[1])]
+             else: # Fallback column names
+                  df_actions.columns = [f'action_{i}' for i in range(df_actions.shape[1])]
+        except Exception:
+             # Fallback if error accessing initial data or 'tic'
+             df_actions.columns = [f'action_{i}' for i in range(df_actions.shape[1])]
+
+        df_actions['date'] = date_list
+        df_actions = df_actions.set_index(pd.Index(date_list, name='date'))
         return df_actions
 
     def _seed(self, seed=None):

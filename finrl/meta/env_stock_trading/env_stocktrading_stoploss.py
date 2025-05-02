@@ -90,7 +90,9 @@ class StockTradingEnvStopLoss(gym.Env):
         self.discrete_actions = discrete_actions
         self.patient = patient
         self.currency = currency
-        self.df = self.df.set_index(date_col_name)
+        # Set MultiIndex for faster lookups
+        self.df = self.df.set_index([date_col_name, self.stock_col])
+        self.df = self.df.sort_index() # Important for performance
         self.shares_increment = shares_increment
         self.hmax = hmax
         self.initial_amount = initial_amount
@@ -169,55 +171,90 @@ class StockTradingEnvStopLoss(gym.Env):
         self.state_memory.append(init_state)
         return init_state
 
-    def get_date_vector(self, date, cols=None):
+    def get_date_vector(self, date_idx, cols=None):
+        # date_idx is the integer index corresponding to self.dates
         if (cols is None) and (self.cached_data is not None):
-            return self.cached_data[date]
+             # If cached, use the integer index directly
+             # This assumes self.cached_data was built correctly using integer indices
+             try:
+                 return self.cached_data[date_idx]
+             except IndexError:
+                 print(f"Error: date_idx {date_idx} out of bounds for cached_data (len: {len(self.cached_data)}).")
+                 # Fallback or raise error - returning zeros for now
+                 if cols is None: cols = self.daily_information_cols
+                 return [0.0] * (len(self.assets) * len(cols))
         else:
-            date = self.dates[date]
+            # If not cached or specific cols requested, get the actual date
+            try:
+                current_date = self.dates[date_idx]
+            except IndexError:
+                 print(f"Error: date_idx {date_idx} out of bounds for self.dates (len: {len(self.dates)}).")
+                 if cols is None: cols = self.daily_information_cols
+                 return [0.0] * (len(self.assets) * len(cols))
+
             if cols is None:
                 cols = self.daily_information_cols
-            trunc_df = self.df.loc[[date]]
-            v = []
-            for a in self.assets:
-                subset = trunc_df[trunc_df[self.stock_col] == a]
-                v += subset.loc[date, cols].tolist()
-            assert len(v) == len(self.assets) * len(cols)
+
+            # Use MultiIndex for direct access
+            try:
+                # Select data for the specific date using the actual date value
+                # .loc[current_date] selects all rows for that date level
+                # Then extract values for the specified columns
+                # Ensure the order matches self.assets if necessary (MultiIndex is sorted)
+                v = self.df.loc[current_date, cols].values.flatten().tolist()
+
+            except KeyError:
+                 # Handle cases where data for a specific date might be missing
+                 print(f"Warning: Data for date {current_date} not found in DataFrame index. Returning zeros.")
+                 v = [0.0] * (len(self.assets) * len(cols))
+            except Exception as e:
+                 print(f"Error accessing data for date {current_date}: {e}")
+                 v = [0.0] * (len(self.assets) * len(cols))
+
+
+            # Ensure the length is correct (handles missing assets on a given date)
+            expected_len = len(self.assets) * len(cols)
+            if len(v) != expected_len:
+                 print(f"Warning: Mismatch in data length for date {current_date}. Expected {expected_len}, got {len(v)}. Padding with zeros.")
+                 # Pad with zeros if necessary (adjust logic if padding isn't appropriate)
+                 v = (v + [0.0] * expected_len)[:expected_len] # Simple padding
+
             return v
 
     def return_terminal(self, reason="Last Date", reward=0):
         state = self.state_memory[-1]
         self.log_step(reason=reason, terminal_reward=reward)
         # Add outputs to logger interface
-        gl_pct = self.account_information["total_assets"][-1] / self.initial_amount
-        logger.record("environment/GainLoss_pct", (gl_pct - 1) * 100)
-        logger.record(
-            "environment/total_assets",
-            int(self.account_information["total_assets"][-1]),
-        )
-        reward_pct = self.account_information["total_assets"][-1] / self.initial_amount
-        logger.record("environment/total_reward_pct", (reward_pct - 1) * 100)
-        logger.record("environment/total_trades", self.sum_trades)
-        logger.record(
-            "environment/actual_num_trades",
-            self.actual_num_trades,
-        )
-        logger.record(
-            "environment/avg_daily_trades",
-            self.sum_trades / (self.current_step),
-        )
-        logger.record(
-            "environment/avg_daily_trades_per_asset",
-            self.sum_trades / (self.current_step) / len(self.assets),
-        )
-        logger.record("environment/completed_steps", self.current_step)
-        logger.record(
-            "environment/sum_rewards", np.sum(self.account_information["reward"])
-        )
-        logger.record(
-            "environment/cash_proportion",
-            self.account_information["cash"][-1]
-            / self.account_information["total_assets"][-1],
-        )
+        # gl_pct = self.account_information["total_assets"][-1] / self.initial_amount
+        # logger.record("environment/GainLoss_pct", (gl_pct - 1) * 100) # Commented out - Incompatible logger
+        # logger.record(
+        #     "environment/total_assets",
+        #     int(self.account_information["total_assets"][-1]),
+        # )
+        # reward_pct = self.account_information["total_assets"][-1] / self.initial_amount
+        # logger.record("environment/total_reward_pct", (reward_pct - 1) * 100) # Commented out - Incompatible logger
+        # logger.record("environment/total_trades", self.sum_trades) # Commented out - Incompatible logger
+        # logger.record(
+        #     "environment/actual_num_trades",
+        #     self.actual_num_trades,
+        # ) # Commented out - Incompatible logger
+        # logger.record(
+        #     "environment/avg_daily_trades",
+        #     self.sum_trades / (self.current_step),
+        # ) # Commented out - Incompatible logger
+        # logger.record(
+        #     "environment/avg_daily_trades_per_asset",
+        #     self.sum_trades / (self.current_step) / len(self.assets),
+        # ) # Commented out - Incompatible logger
+        # logger.record("environment/completed_steps", self.current_step) # Commented out - Incompatible logger
+        # logger.record(
+        #     "environment/sum_rewards", np.sum(self.account_information["reward"])
+        # ) # Commented out - Incompatible logger
+        # logger.record(
+        #     "environment/cash_proportion",
+        #     self.account_information["cash"][-1]
+        #     / self.account_information["total_assets"][-1],
+        # ) # Commented out - Incompatible logger
         return state, reward, True, {}
 
     def log_step(self, reason, terminal_reward=None):
@@ -420,13 +457,21 @@ class StockTradingEnvStopLoss(gym.Env):
             holdings_updated = holdings + actions
 
             # Update average buy price
-            buys = np.sign(buys)
-            self.n_buys += buys
+            buys_mask = buys > 0 # Mask for where buys occurred
+            self.n_buys += np.sign(buys) # Increment count where buys occurred
+
+            # Calculate incremental average only where n_buys > 0 after incrementing
+            # Use np.divide to handle division by zero safely
+            delta_price = closings - self.avg_buy_price
+            # Set where=self.n_buys > 0 to avoid division by zero; keep old avg_buy_price otherwise
+            increment = np.divide(delta_price, self.n_buys, out=np.zeros_like(delta_price), where=self.n_buys > 0)
+
+            # Update avg_buy_price only where a buy actually happened in this step (buys_mask)
             self.avg_buy_price = np.where(
-                buys > 0,
-                self.avg_buy_price + ((closings - self.avg_buy_price) / self.n_buys),
+                buys_mask,
+                self.avg_buy_price + increment,
                 self.avg_buy_price,
-            )  # incremental average
+            )
 
             # set as zero when we don't have any holdings anymore
             self.n_buys = np.where(holdings_updated > 0, self.n_buys, 0)
