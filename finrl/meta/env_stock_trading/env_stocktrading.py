@@ -318,7 +318,7 @@ class StockTradingEnv(gym.Env):
 
             for index in buy_index:
                 actions[index] = self._buy_stock(index, actions[index])
-
+            
             self.actions_memory.append(actions)
 
             # state: s -> s+1
@@ -330,6 +330,7 @@ class StockTradingEnv(gym.Env):
             self.state = self._update_state()
 
             # Calculate end total asset *after* state update
+            # state[1:stock_dim+1] = prices, state[stock_dim+1:2*stock_dim+1] = holdings
             end_total_asset = self.state[0] + sum(
                 np.array(self.state[1 : (self.stock_dim + 1)])
                 * np.array(self.state[(self.stock_dim + 1) : (self.stock_dim * 2 + 1)])
