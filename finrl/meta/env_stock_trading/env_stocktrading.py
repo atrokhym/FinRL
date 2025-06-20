@@ -279,7 +279,8 @@ class StockTradingEnv(gym.Env):
                 plt.close()
 
             # Gymnasium expects 5 return values: obs, reward, terminated, truncated, info
-            return self.state, self.reward, self.terminal, False, {} # Return truncated as False when terminal
+            # CRITICAL: Convert reward to Python float to prevent numpy.float32 → torch.FloatTensor error in ElegantRL
+            return self.state, float(self.reward), self.terminal, False, {} # Return truncated as False when terminal
 
         else:
             actions = actions * self.hmax  # actions initially is scaled between 0 to 1
@@ -343,7 +344,8 @@ class StockTradingEnv(gym.Env):
             self.state_memory.append(self.state)
 
             # Gymnasium expects 5 return values: obs, reward, terminated, truncated, info
-            return self.state, self.reward, self.terminal, False, {} # Return truncated as False
+            # CRITICAL: Convert reward to Python float to prevent numpy.float32 → torch.FloatTensor error in ElegantRL
+            return self.state, float(self.reward), self.terminal, False, {} # Return truncated as False
 
     def reset(
         self,
